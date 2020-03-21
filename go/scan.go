@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
 	"math/rand"
 	"net"
 	"os"
@@ -76,20 +75,39 @@ func main() {
 				recvSynAck(results)
 			}
 		}(10)
+	} else if *ScanWay == "FIN" {
+		go func(num int) {
+			for i := 0; i < num; i++ {
+				recvRst(results)
+			}
+		}(10)
 	}
 
+
+	var ports []uint16
 	if *portRange == "common" {
-		go producer(jobs, 0, 0)
+		ports = CommonPort
 	} else {
 		SPort, DPort := portSplit(portRange)
-		go producer(jobs, SPort, DPort)
+		for p := SPort; p <= DPort; p++ {
+			ports = append(ports, p)
+		}
 	}
+
+	go producer(jobs, ports)
 
 	for {
 		select {
 		case res := <-results:
 			fmt.Println("Open: ", res.Port)
 		case <-StopChan:
+			if *ScanWay == "FIN" {
+				for _, v := range ports {
+					if vis[v] == false {
+						fmt.Println("Open: ", v)
+					}
+				}
+			}
 			eTime := time.Now().Unix()
 			fmt.Println("Time: ", eTime-sTime, "s")
 			os.Exit(0)
@@ -97,27 +115,15 @@ func main() {
 	}
 }
 
-func producer(jobs chan *scanJob, SPort, DPort uint16) {
-	if SPort == 0 && DPort == 0 {
-		for _, p := range CommonPort {
-			s := scanJob{
-				Laddr: LAddr,
-				Raddr: RAddr,
-				SPort: uint16(random(10000, 65535)),
-				DPort: p,
-			}
-			jobs <- &s
+func producer(jobs chan *scanJob, ports []uint16) {
+	for _, p := range ports {
+		s := scanJob{
+			Laddr: LAddr,
+			Raddr: RAddr,
+			SPort: uint16(random(10000, 65535)),
+			DPort: p,
 		}
-	} else {
-		for p := SPort; p <= DPort; p++ {
-			s := scanJob{
-				Laddr: LAddr,
-				Raddr: RAddr,
-				SPort: uint16(random(10000, 65535)),
-				DPort: p,
-			}
-			jobs <- &s
-		}
+		jobs <- &s
 	}
 	jobs <- &scanJob{Stop: true}
 	close(jobs)
@@ -134,6 +140,9 @@ func consumer(jobs <-chan *scanJob, results chan<- *scanResult) {
 				time.Sleep(1e7)
 			} else if *ScanWay == "TCP" {
 				TcpScan(j, results)
+			} else if *ScanWay == "FIN" {
+				FinScan(j)
+				time.Sleep(1e7)
 			}
 		}
 	}
@@ -150,42 +159,57 @@ func TcpScan(j *scanJob, result chan<- *scanResult) {
 	}
 }
 
-func SynScan(j *scanJob) {
-	conn, err := net.Dial("ip4:tcp", j.Raddr)
-	checkError(err)
-	defer conn.Close()
+func makePkg(j *scanJob) []byte {
+	var flag uint16
+	if *ScanWay == "SYN" {
+		flag = 0x8002		// 8: 32 header length
+	} else if *ScanWay == "FIN" {
+		flag = 0x5001		// 5: 20 header length
+	}
 	tcpH := TCPHeader{
 		SrcPort:       j.SPort,
 		DstPort:       j.DPort,
 		SeqNum:        rand.Uint32(),
 		AckNum:        0,
-		Flags:         0x8002,
+		Flags:         flag,
 		Window:        8192,
 		ChkSum:        0,
 		UrgentPointer: 0,
 	}
-	buff := new(bytes.Buffer)
-	err = binary.Write(buff, binary.BigEndian, tcpH)
+	buf := new(bytes.Buffer)
+	err := binary.Write(buf, binary.BigEndian, tcpH)
 	checkError(err)
-	err = binary.Write(buff, binary.BigEndian, [12]byte{})
+	if *ScanWay == "SYN" {
+		err = binary.Write(buf, binary.BigEndian, [12]byte{0})
+		checkError(err)
+	}
+	tcpH.ChkSum = CheckSum(buf.Bytes(), ip2Bytes(j.Laddr), ip2Bytes(j.Raddr))
+	buf = new(bytes.Buffer)
+	err = binary.Write(buf, binary.BigEndian, tcpH)
 	checkError(err)
-	data := buff.Bytes()
-	checkSum := CheckSum(data, ip2Bytes(j.Laddr), ip2Bytes(j.Raddr))
-	tcpH.ChkSum = checkSum
-	buff = new(bytes.Buffer)
-	err = binary.Write(buff, binary.BigEndian, tcpH)
+	if *ScanWay == "SYN" {
+		err = binary.Write(buf, binary.BigEndian, [12]byte{0})
+		checkError(err)
+	}
+	return buf.Bytes()
+}
+
+func FinScan(j *scanJob) {
+	conn, err := net.Dial("ip4:tcp", j.Raddr)
 	checkError(err)
-	err = binary.Write(buff, binary.BigEndian, [12]byte{})
-	checkError(err)
-	data = buff.Bytes()
-	_, err = conn.Write(data)
+	defer conn.Close()
+	pkg := makePkg(j)
+	_, err = conn.Write(pkg)
 	checkError(err)
 }
 
-func checkError(err error) {
-	if err != nil {
-		log.Println(err)
-	}
+func SynScan(j *scanJob) {
+	conn, err := net.Dial("ip4:tcp", j.Raddr)
+	checkError(err)
+	defer conn.Close()
+	pkg := makePkg(j)
+	_, err = conn.Write(pkg)
+	checkError(err)
 }
 
 func CheckSum(data []byte, src, dst [4]byte) uint16 {
@@ -221,27 +245,51 @@ func recvSynAck(res chan<- *scanResult) {
 	listenAddr, err := net.ResolveIPAddr("ip4", LAddr) // 解析域名为ip
 	checkError(err)
 	conn, err := net.ListenIP("ip4:tcp", listenAddr)
-	defer conn.Close()
 	checkError(err)
+	defer conn.Close()
 	for {
-		buff := make([]byte, 1024)
-		_, addr, err := conn.ReadFrom(buff)
+		buf := make([]byte, 1024)
+		_, addr, err := conn.ReadFrom(buf)
 		if err != nil {
 			continue
 		}
-
-		if addr.String() != RAddr || buff[13] != 0x12 {
+		if addr.String() != RAddr || buf[13] != 0x12 { // 10010 syn=1
 			continue
 		}
 		var port uint16
-		err = binary.Read(bytes.NewReader(buff), binary.BigEndian, &port)
+		err = binary.Read(bytes.NewReader(buf), binary.BigEndian, &port)
 		checkError(err)
-
 		if vis[port] {
 			continue
 		}
 		res <- &scanResult{
 			Port: port,
+		}
+		vis[port] = true
+	}
+}
+
+func recvRst(res chan<- *scanResult) {
+	listenAddr, err := net.ResolveIPAddr("ip4", LAddr)
+	checkError(err)
+	conn, err := net.ListenIP("ip4:tcp", listenAddr)
+	checkError(err)
+	defer conn.Close()
+	for {
+		buf := make([]byte, 1024)
+		_, addr, err := conn.ReadFrom(buf)
+		if err != nil {
+			continue
+		}
+		//fmt.Println(buf[13])
+		if addr.String() != RAddr || buf[13] != 0x14 { // 10100 rst=1
+			continue
+		}
+		var port uint16
+		err = binary.Read(bytes.NewReader(buf), binary.BigEndian, &port)
+		checkError(err)
+		if vis[port] {
+			continue
 		}
 		vis[port] = true
 	}
@@ -279,6 +327,12 @@ func getLAddr() string {
 
 	addrStr := strings.Split(addr[f].String(), "/")[0]
 	return addrStr
+}
+
+func checkError(err error) {
+	if err != nil {
+		panic(err)
+	}
 }
 
 func portSplit(portRange *string) (uint16, uint16) {
